@@ -1,4 +1,4 @@
-name: Upload England GTFS splits
+name: Upload Great Britain GTFS splits
 on:
   workflow_call:
 jobs:
@@ -7,19 +7,19 @@ jobs:
     permissions:
       contents: write
     concurrency:
-      group: england-gtfs-release
+      group: gb-gtfs-release
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - name: Download England GTFS
-        run: curl --fail --location --retry 3 --output england.zip https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/england/
+      - name: Download Great Britain GTFS
+        run: curl --fail --location --retry 3 --output gb.zip https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/all/
       - name: Check source and splitter fingerprint
         id: fingerprint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sha256sum england.zip level-2.geojson src/main.rs Cargo.toml Cargo.lock > england.sha256
-          if gh release download latest --pattern england.sha256 --output previous.sha256 && cmp -s england.sha256 previous.sha256; then
+          sha256sum gb.zip level-2.geojson area_names.tsv greater_manchester.geojson src/main.rs Cargo.toml Cargo.lock > gb.sha256
+          if gh release download latest --pattern gb.sha256 --output previous.sha256 && cmp -s gb.sha256 previous.sha256; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -29,8 +29,8 @@ jobs:
       - name: Extract and split
         if: steps.fingerprint.outputs.skip != 'true'
         run: |
-          unzip -q england.zip -d gtfs_raw
-          rm england.zip
+          unzip -q gb.zip -d gtfs_raw
+          rm gb.zip
           cargo test --locked
           cargo run --locked --release
       - name: Zip county feeds
@@ -47,6 +47,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view latest >/dev/null 2>&1 || gh release create latest --title "Latest England GTFS splits" --notes "Automatically updated county GTFS feeds." --prerelease
+          gh release view latest >/dev/null 2>&1 || gh release create latest --title "Latest Great Britain GTFS splits" --notes "Automatically updated county GTFS feeds." --prerelease
           gh release upload latest zips/*.zip --clobber
-          gh release upload latest england.sha256 --clobber
+          # Remove stale split ZIPs only after all replacement ZIPs upload.
+          gh release view latest --json assets --jq '.assets[].name' > published-assets.txt
+          while IFS= read -r asset; do
+            case "$asset" in
+              *.zip)
+                if [ ! -f "zips/$asset" ]; then
+                  gh release delete-asset latest "$asset" --yes
+                fi
+                ;;
+            esac
+          done < published-assets.txt
+          if grep -Fxq england.sha256 published-assets.txt; then
+            gh release delete-asset latest england.sha256 --yes
+          fi
+          gh release upload latest gb.sha256 --clobber
