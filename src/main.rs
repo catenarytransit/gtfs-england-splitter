@@ -31,6 +31,8 @@ struct Properties {
     id: String,
     #[serde(rename = "NAME_2", default)]
     name: Option<String>,
+    #[serde(rename = "HASC_2", default)]
+    hasc: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -40,8 +42,22 @@ enum Geometry {
     MultiPolygon { coordinates: Vec<Polygon> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nation { England, Scotland, Wales, NorthernIreland }
+
+fn nation(id: &str) -> Option<Nation> {
+    match id.split('.').nth(1)? {
+        "1" => Some(Nation::England),
+        "2" => Some(Nation::NorthernIreland),
+        "3" => Some(Nation::Scotland),
+        "4" => Some(Nation::Wales),
+        _ => None,
+    }
+}
+
 struct County {
     folder: String,
+    nation: Nation,
     polygons: Vec<(Bbox, Polygon)>,
 }
 
@@ -53,12 +69,23 @@ fn slug(name: &str) -> String {
         .join("_")
 }
 
-fn county_name(properties: &Properties) -> String {
+fn county_name(properties: &Properties) -> Result<String> {
+    // GID disambiguates reused HASC codes (e.g. Bedford and Central Bedfordshire).
+    for row in include_str!("../area_names.tsv").lines().skip(1) {
+        let mut fields = row.split('\t');
+        if fields.next() == Some(properties.id.as_str()) {
+            let hasc = fields.next();
+            if hasc != properties.hasc.as_deref() {
+                return Err(invalid(format!("HASC changed for {}", properties.id)).into());
+            }
+            return Ok(slug(fields.next().ok_or_else(|| invalid("Missing override name"))?));
+        }
+    }
     properties.name.as_deref()
         .filter(|name| !name.trim().is_empty() && !name.eq_ignore_ascii_case("NA"))
         .map(slug)
         .filter(|name| !name.is_empty() && name != "other")
-        .unwrap_or_else(|| slug(&properties.id))
+        .ok_or_else(|| invalid(format!("Missing name for {} ({:?})", properties.id, properties.hasc)).into())
 }
 
 fn bbox(polygon: &Polygon) -> Bbox {
@@ -111,38 +138,64 @@ fn county_at(counties: &[County], lon: f64, lat: f64) -> Option<usize> {
 
 fn load_counties(path: &Path) -> Result<Vec<County>> {
     let data: GeoJson = serde_json::from_reader(io::BufReader::new(fs::File::open(path)?))?;
-    // GADM's GID is more reliable than NAME_1, which is NA for some English features.
-    let english: Vec<_> = data.features.into_iter()
-        .filter(|feature| feature.properties.id.starts_with("GBR.1."))
-        .collect();
-    if english.is_empty() {
-        return Err(invalid("No English level-2 boundaries found").into());
-    }
-    let mut counts = HashMap::new();
-    for feature in &english {
-        *counts.entry(county_name(&feature.properties)).or_insert(0usize) += 1;
-    }
-    let mut counties = Vec::new();
-    let mut folders = HashSet::new();
-    for feature in english {
-        let base = county_name(&feature.properties);
-        let folder = if counts[&base] > 1 {
-            format!("{}_{}", base, slug(&feature.properties.id))
-        } else {
-            base
-        };
-        if !folders.insert(folder.clone()) {
-            return Err(invalid(format!("Duplicate county folder: {folder}")).into());
+    let mut counties: Vec<County> = Vec::new();
+    let mut folders: HashMap<String, usize> = HashMap::new();
+    for feature in data.features {
+        let country = nation(&feature.properties.id)
+            .ok_or_else(|| invalid(format!("Unknown nation for {}", feature.properties.id)))?;
+        // Validate NI names too, although NI is outside the Great Britain feed.
+        let mut folder = county_name(&feature.properties)?;
+        if country == Nation::NorthernIreland { continue; }
+        // These ten GADM areas are the majority-overlapping areas identified
+        // against the supplied greater_manchester.geojson boundary.
+        if country == Nation::England && [
+            "GBR.1.7_1", "GBR.1.14_1", "GBR.1.54_1", "GBR.1.68_1",
+            "GBR.1.76_1", "GBR.1.80_1", "GBR.1.93_1", "GBR.1.100_1",
+            "GBR.1.104_1", "GBR.1.111_1",
+        ].contains(&feature.properties.id.as_str()) {
+            folder = "greater_manchester".to_owned();
         }
         let polygons = match feature.geometry {
             Geometry::Polygon { coordinates } => vec![coordinates],
             Geometry::MultiPolygon { coordinates } => coordinates,
         };
-        let polygons = polygons.into_iter().map(|polygon| (bbox(&polygon), polygon)).collect();
-        counties.push(County { folder, polygons });
+        let polygons = polygons.into_iter().map(|polygon| (bbox(&polygon), polygon));
+        if let Some(&index) = folders.get(&folder) {
+            if counties[index].nation != country {
+                return Err(invalid(format!("Conflicting nations for {folder}")).into());
+            }
+            counties[index].polygons.extend(polygons);
+        } else {
+            folders.insert(folder.clone(), counties.len());
+            counties.push(County { folder, nation: country, polygons: polygons.collect() });
+        }
+    }
+    if counties.is_empty() {
+        return Err(invalid("No Great Britain boundaries found").into());
     }
     counties.sort_by(|a, b| a.folder.cmp(&b.folder));
     Ok(counties)
+}
+
+// An operator qualifies only when every scheduled stop call is located in
+// one nation and at least three distinct local authorities are served.
+const NATIONAL_MIN_AREAS: usize = 3;
+#[derive(Default)]
+struct AgencyCoverage {
+    areas: HashSet<usize>,
+    unknown: bool,
+}
+fn national_destination(coverage: &AgencyCoverage, nations: &[Nation], wales: usize, scotland: usize) -> Option<usize> {
+    if coverage.unknown || coverage.areas.len() < NATIONAL_MIN_AREAS {
+        return None;
+    }
+    if coverage.areas.iter().all(|&i| nations[i] == Nation::Wales) {
+        Some(wales)
+    } else if coverage.areas.iter().all(|&i| nations[i] == Nation::Scotland) {
+        Some(scotland)
+    } else {
+        None
+    }
 }
 
 struct Table {
@@ -270,10 +323,18 @@ fn dominant_county(counts: &HashMap<usize, u64>, other: usize) -> usize {
 
 fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
     let counties = load_counties(boundaries)?;
-    println!("Loaded {} English level-2 boundaries", counties.len());
-    let other = counties.len();
+    println!("Loaded {} Great Britain output areas", counties.len());
+    let nations: Vec<_> = counties.iter().map(|county| county.nation).collect();
     let mut names: Vec<_> = counties.iter().map(|county| county.folder.clone()).collect();
+    let other = names.len();
     names.push("other".into());
+    let wales = names.len();
+    names.push("wales".into());
+    let scotland = names.len();
+    names.push("scotland".into());
+    if names.iter().collect::<HashSet<_>>().len() != names.len() {
+        return Err(invalid("Duplicate or reserved output name").into());
+    }
 
     let mut stops = HashMap::new();
     {
@@ -299,7 +360,7 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
     let stop_counties: HashMap<&str, usize> = stops.keys().filter_map(|id| {
         stop_county(id, &stops).map(|county| (id.as_str(), county))
     }).collect();
-    println!("Matched {} of {} stops to English boundaries", stop_counties.len(), stops.len());
+    println!("Matched {} of {} stops to Great Britain boundaries", stop_counties.len(), stops.len());
 
     let mut agency_ids = HashSet::new();
     {
@@ -358,6 +419,7 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
 
     // First pass: count all mapped stop calls for each route, not each operator.
     let mut counts = vec![HashMap::new(); routes.len()];
+    let mut coverage: HashMap<&str, AgencyCoverage> = HashMap::new();
     {
         let mut table = Table::open(input, "stop_times.txt")?;
         let trip = table.column("trip_id")?;
@@ -368,8 +430,12 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
             let route = *trip_routes.get(&row[trip]).ok_or_else(|| {
                 invalid(format!("Unknown stop_times trip_id: {}", &row[trip]))
             })?;
+            let agency = coverage.entry(route_agencies[route].as_str()).or_default();
             if let Some(&county) = stop_counties.get(&row[stop]) {
                 *counts[route].entry(county).or_insert(0u64) += 1;
+                agency.areas.insert(county);
+            } else {
+                agency.unknown = true;
             }
             processed += 1;
             if processed % 10_000_000 == 0 {
@@ -380,9 +446,14 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
     drop(stop_counties);
 
     let route_folders: Vec<Option<usize>> = counts.iter().enumerate()
-        .map(|(index, counts)| route_has_trips[index].then(|| dominant_county(counts, other)))
+        .map(|(index, counts)| route_has_trips[index].then(|| {
+            coverage.get(route_agencies[index].as_str())
+                .and_then(|area| national_destination(area, &nations, wales, scotland))
+                .unwrap_or_else(|| dominant_county(counts, other))
+        }))
         .collect();
     drop(counts);
+    drop(coverage);
     let mut active = vec![false; names.len()];
     let mut agencies_needed = Membership::new();
     for (index, folder) in route_folders.iter().enumerate() {
@@ -563,12 +634,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_boundaries_have_unique_english_names() {
+    fn bundled_boundaries_have_unique_gb_names() {
         let counties = load_counties(Path::new("level-2.geojson")).unwrap();
-        assert_eq!(counties.len(), 118);
+        assert_eq!(counties.len(), 162);
+        assert!(counties.iter().any(|county| county.folder == "greater_london"));
+        assert!(counties.iter().any(|county| county.folder == "hertfordshire"));
+        assert!(counties.iter().any(|county| county.folder == "greater_manchester"));
+        assert!(counties.iter().any(|county| county.folder == "north_ayrshire"));
+        assert!(counties.iter().any(|county| county.folder == "gwynedd"));
+        assert!(!counties.iter().any(|county| county.folder.starts_with("gbr_")));
+        assert!(!counties.iter().any(|county| county.nation == Nation::NorthernIreland));
         assert!(counties.iter().any(|county| county.folder == "kent"));
         assert!(counties.iter().any(|county| county.folder == "surrey"));
         assert!(!counties.iter().any(|county| county.folder == "na" || county.folder == "other"));
+    }
+
+    #[test]
+    fn national_grouping_requires_three_areas_and_exclusivity() {
+        let nations = [Nation::Wales, Nation::Wales, Nation::Wales,
+            Nation::Scotland, Nation::Scotland, Nation::Scotland, Nation::England];
+        let coverage = |areas: &[usize], unknown| AgencyCoverage {
+            areas: areas.iter().copied().collect(), unknown,
+        };
+        assert_eq!(national_destination(&coverage(&[0, 1, 2], false), &nations, 7, 8), Some(7));
+        assert_eq!(national_destination(&coverage(&[3, 4, 5], false), &nations, 7, 8), Some(8));
+        assert_eq!(national_destination(&coverage(&[0, 1], false), &nations, 7, 8), None);
+        assert_eq!(national_destination(&coverage(&[0, 1, 2, 6], false), &nations, 7, 8), None);
+        assert_eq!(national_destination(&coverage(&[3, 4, 5], true), &nations, 7, 8), None);
     }
 
     #[test]
@@ -587,16 +679,16 @@ mod tests {
         let output = dir.join("output");
         let boundaries = dir.join("boundaries.geojson");
         fs::write(&boundaries, r#"{"features":[
-            {"properties":{"GID_2":"GBR.1.1_1","NAME_2":"Alpha"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[2,0],[2,2],[0,2],[0,0]],[[0.5,0.5],[0.8,0.5],[0.8,0.8],[0.5,0.8],[0.5,0.5]]]}},
-            {"properties":{"GID_2":"GBR.1.2_1","NAME_2":"Beta"},"geometry":{"type":"MultiPolygon","coordinates":[[[[2,0],[4,0],[4,2],[2,2],[2,0]]]]}},
-            {"properties":{"GID_2":"GBR.1.3_1","NAME_2":"NA"},"geometry":{"type":"Polygon","coordinates":[[[4,0],[6,0],[6,2],[4,2],[4,0]]]}},
-            {"properties":{"GID_2":"GBR.4.1_1","NAME_2":"Wales"},"geometry":{"type":"Polygon","coordinates":[[[6,0],[8,0],[8,2],[6,2],[6,0]]]}}
+            {"properties":{"GID_2":"GBR.1.901_1","NAME_2":"Alpha"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[2,0],[2,2],[0,2],[0,0]],[[0.5,0.5],[0.8,0.5],[0.8,0.8],[0.5,0.8],[0.5,0.5]]]}},
+            {"properties":{"GID_2":"GBR.1.902_1","NAME_2":"Beta"},"geometry":{"type":"MultiPolygon","coordinates":[[[[2,0],[4,0],[4,2],[2,2],[2,0]]]]}},
+            {"properties":{"GID_2":"GBR.1.903_1","NAME_2":"Gamma"},"geometry":{"type":"Polygon","coordinates":[[[4,0],[6,0],[6,2],[4,2],[4,0]]]}},
+            {"properties":{"GID_2":"GBR.2.901_1","NAME_2":"OutsideGB"},"geometry":{"type":"Polygon","coordinates":[[[6,0],[8,0],[8,2],[6,2],[6,0]]]}}
         ]}"#).unwrap();
         let counties = load_counties(&boundaries).unwrap();
         assert_eq!(counties.len(), 3);
         assert_eq!(county_at(&counties, 0.6, 0.6), None); // polygon hole
         assert_eq!(county_at(&counties, 2.0, 1.0), Some(0)); // deterministic border
-        assert_eq!(counties[county_at(&counties, 5.0, 1.0).unwrap()].folder, "gbr_1_3_1");
+        assert_eq!(counties[county_at(&counties, 5.0, 1.0).unwrap()].folder, "gamma");
         assert_eq!(county_at(&counties, 7.0, 1.0), None);
         let files = [
             ("agency.txt", "agency_id,agency_name\na,Operator\n"),
