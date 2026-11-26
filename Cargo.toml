@@ -1,5 +1,5 @@
 [package]
-name = "gtfs-de-splitter"
+name = "gtfs-england-splitter"
 version = "0.1.0"
 edition = "2024"
 
