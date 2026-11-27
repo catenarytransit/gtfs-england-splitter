@@ -180,6 +180,18 @@ fn load_counties(path: &Path) -> Result<Vec<County>> {
 // An operator qualifies only when every scheduled stop call is located in
 // one nation and at least three distinct local authorities are served.
 const NATIONAL_MIN_AREAS: usize = 3;
+
+const COACH_FEEDS: [(&str, &str, &str); 3] = [
+    ("OP5050", "NATX", "national_express"),
+    ("OP5051", "FLIX", "flixbus"),
+    ("OP755", "BYCO", "berrys_coaches"),
+];
+
+fn coach_feed(id: &str, noc: &str) -> Option<usize> {
+    COACH_FEEDS.iter().position(|&(agency, code, _)| {
+        id == agency || noc.trim().eq_ignore_ascii_case(code)
+    })
+}
 #[derive(Default)]
 struct AgencyCoverage {
     areas: HashSet<usize>,
@@ -332,6 +344,8 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
     names.push("wales".into());
     let scotland = names.len();
     names.push("scotland".into());
+    let coach_start = names.len();
+    names.extend(COACH_FEEDS.iter().map(|&(_, _, name)| name.to_owned()));
     if names.iter().collect::<HashSet<_>>().len() != names.len() {
         return Err(invalid("Duplicate or reserved output name").into());
     }
@@ -363,12 +377,17 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
     println!("Matched {} of {} stops to Great Britain boundaries", stop_counties.len(), stops.len());
 
     let mut agency_ids = HashSet::new();
+    let mut coach_agencies = HashMap::new();
     {
         let mut table = Table::open(input, "agency.txt")?;
         let id = table.optional("agency_id");
+        let noc = table.optional("agency_noc");
         let mut row = Record::new();
         while table.reader.read_record(&mut row)? {
             let id = field(&row, id);
+            if let Some(index) = coach_feed(id, field(&row, noc)) {
+                coach_agencies.insert(id.to_owned(), coach_start + index);
+            }
             if !agency_ids.insert(id.to_owned()) {
                 return Err(invalid(format!("Duplicate agency_id: {id}")).into());
             }
@@ -430,6 +449,9 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
             let route = *trip_routes.get(&row[trip]).ok_or_else(|| {
                 invalid(format!("Unknown stop_times trip_id: {}", &row[trip]))
             })?;
+            if coach_agencies.contains_key(route_agencies[route].as_str()) {
+                continue;
+            }
             let agency = coverage.entry(route_agencies[route].as_str()).or_default();
             if let Some(&county) = stop_counties.get(&row[stop]) {
                 *counts[route].entry(county).or_insert(0u64) += 1;
@@ -447,8 +469,9 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
 
     let route_folders: Vec<Option<usize>> = counts.iter().enumerate()
         .map(|(index, counts)| route_has_trips[index].then(|| {
-            coverage.get(route_agencies[index].as_str())
-                .and_then(|area| national_destination(area, &nations, wales, scotland))
+            coach_agencies.get(route_agencies[index].as_str()).copied()
+                .or_else(|| coverage.get(route_agencies[index].as_str())
+                    .and_then(|area| national_destination(area, &nations, wales, scotland)))
                 .unwrap_or_else(|| dominant_county(counts, other))
         }))
         .collect();
@@ -621,7 +644,7 @@ fn split(input: &Path, boundaries: &Path, root: &Path) -> Result<()> {
             }
         }
     }
-    println!("Wrote {} county feeds (including other if needed)", output.active.iter().filter(|&&active| active).count());
+    println!("Wrote {} GTFS feeds (including operator feeds and other if needed)", output.active.iter().filter(|&&active| active).count());
     Ok(())
 }
 
@@ -691,11 +714,11 @@ mod tests {
         assert_eq!(counties[county_at(&counties, 5.0, 1.0).unwrap()].folder, "gamma");
         assert_eq!(county_at(&counties, 7.0, 1.0), None);
         let files = [
-            ("agency.txt", "agency_id,agency_name\na,Operator\n"),
-            ("routes.txt", "route_id,agency_id,route_short_name\nr1,a,1\nr2,a,2\nr3,a,3\n"),
-            ("trips.txt", "route_id,service_id,trip_id,shape_id\nr1,s,t1,sh\nr2,s,t2,sh\nr3,s,t3,\n"),
+            ("agency.txt", "agency_id,agency_name,agency_noc\na,Operator,LOCAL\nOP5050,National Express,NATX\nnewflix,FlixBus,FLIX\nOP755,Berry's Coaches,BYCO\n"),
+            ("routes.txt", "route_id,agency_id,route_short_name\nr1,a,1\nr2,a,2\nr3,a,3\nr4,OP5050,4\nr5,newflix,5\nr6,OP755,6\n"),
+            ("trips.txt", "route_id,service_id,trip_id,shape_id\nr1,s,t1,sh\nr2,s,t2,sh\nr3,s,t3,\nr4,s,t4,sh\nr5,s,t5,\nr6,s,t6,\n"),
             ("stops.txt", "stop_id,stop_lat,stop_lon,parent_station\np,1,1,\na1,1,1,p\na2,,,p\nb,1,3,\nw,1,7,\n"),
-            ("stop_times.txt", "trip_id,stop_id,stop_sequence\nt1,a1,1\nt1,a2,2\nt1,b,3\nt1,w,4\nt2,b,1\nt3,w,1\n"),
+            ("stop_times.txt", "trip_id,stop_id,stop_sequence\nt1,a1,1\nt1,a2,2\nt1,b,3\nt1,w,4\nt2,b,1\nt3,w,1\nt4,a1,1\nt4,b,2\nt4,w,3\nt5,b,1\nt6,a2,1\n"),
             ("calendar_dates.txt", "service_id,date,exception_type\ns,20261126,1\n"),
             ("shapes.txt", "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\nsh,1,1,1\nsh,1,3,2\n"),
             ("frequencies.txt", "trip_id,start_time,end_time,headway_secs\nt1,08:00:00,09:00:00,600\n"),
@@ -722,6 +745,19 @@ mod tests {
         assert_eq!(read("alpha", "transfers.txt").lines().count(), 2);
         assert!(!output.join("alpha/calendar.txt").exists());
         assert!(!output.join("wales").exists());
+        assert!(read("national_express", "trips.txt").contains("r4,s,t4,sh"));
+        assert_eq!(read("national_express", "stop_times.txt").lines().count(), 4);
+        assert!(read("national_express", "stops.txt").contains("w,1,7,"));
+        assert_eq!(read("national_express", "shapes.txt").lines().count(), 3);
+        assert!(read("national_express", "calendar_dates.txt").contains("s,20261126,1"));
+        assert!(read("flixbus", "trips.txt").contains("r5,s,t5,"));
+        assert!(read("berrys_coaches", "trips.txt").contains("r6,s,t6,"));
+        for folder in ["alpha", "beta", "other"] {
+            let trips = read(folder, "trips.txt");
+            assert!(!trips.contains("t4") && !trips.contains("t5") && !trips.contains("t6"));
+        }
+        assert_eq!(coach_feed("OP5051", ""), Some(1));
+        assert_eq!(coach_feed("OP15966", "NXHH"), None);
         fs::remove_dir_all(dir).unwrap();
     }
 }
